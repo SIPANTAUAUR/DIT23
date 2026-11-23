@@ -1720,7 +1720,9 @@ function extFromType(t) {
 }
 async function cloudUploadBlob(path, blob) {
   const type = blob.type || "application/octet-stream";
-  const { error } = await sb.storage.from(SUPABASE_BUCKET).upload(path, blob, { contentType: type, cacheControl: "31536000", upsert: false });
+  const sizeMB = (blob.size / 1048576).toFixed(1);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error(`waktu habis saat mengunggah file ${sizeMB} MB (koneksi lambat/file terlalu besar)`)), 120000));
+  const { error } = await Promise.race([sb.storage.from(SUPABASE_BUCKET).upload(path, blob, { contentType: type, cacheControl: "31536000", upsert: false }), timeout]);
   if (error) throw error;
   return sb.storage.from(SUPABASE_BUCKET).getPublicUrl(path).data.publicUrl;
 }
@@ -1756,6 +1758,7 @@ async function cloudRemoveReportFiles(id) {
   } catch (_) { /* pembersihan file bersifat opsional */ }
 }
 async function cloudSyncNow() {
+  const failed = new Map();
   try {
     // 1) laporan yang dihapus secara lokal -> hapus di server
     const live = new Set(reports.map(r => String(r.id)));
@@ -1766,26 +1769,38 @@ async function cloudSyncNow() {
       cloudSynced.delete(id);
       cloudRemoveReportFiles(id);
     }
-    // 2) laporan baru / berubah -> unggah media lalu upsert
-    for (const r of reports) {
-      const id = String(r.id);
+  } catch (err) {
+    console.error("Sinkronisasi cloud gagal:", err);
+    showToast("GAGAL terhubung ke server: " + (err && err.message ? err.message : "periksa koneksi internet"));
+    return null;
+  }
+  // 2) laporan baru / berubah -> unggah media lalu upsert (satu laporan bermasalah tidak menghentikan yang lain)
+  const todo = reports.filter(r => !cloudSynced.has(String(r.id)));
+  let doneN = 0;
+  for (const r of reports.slice()) {
+    const id = String(r.id);
+    let prev;
+    try {
+      if (todo.includes(r) && todo.length > 1) { doneN++; showToast(`Mengunggah laporan ${doneN} dari ${todo.length}: ${r.code || id} ...`); }
       await cloudUploadReportMedia(r);
       const payload = cloudPayload(r);
       const json = stableStringify(payload);
       if (cloudSynced.get(id) === json) continue;
-      const prev = cloudSynced.get(id);
+      prev = cloudSynced.get(id);
       cloudSynced.set(id, json); // set lebih dulu agar "gema" realtime milik sendiri diabaikan
       const { error } = await sb.from("reports").upsert({
         id, data: payload, created_at: new Date(Number.isFinite(r.createdAt) ? r.createdAt : Date.now()).toISOString()
       });
-      if (error) { if (prev === undefined) cloudSynced.delete(id); else cloudSynced.set(id, prev); throw error; }
+      if (error) throw error;
+    } catch (err) {
+      if (prev !== undefined || cloudSynced.has(id)) { if (prev === undefined) cloudSynced.delete(id); else cloudSynced.set(id, prev); }
+      const msg = (err && err.message) ? err.message : String(err);
+      failed.set(id, `${r.code || id}: ${msg}`);
+      console.error("Gagal sinkron laporan", id, err);
     }
-    return true;
-  } catch (err) {
-    console.error("Sinkronisasi cloud gagal:", err);
-    showToast("GAGAL mengirim data ke server: " + (err && err.message ? err.message : "periksa koneksi internet") );
-    return false;
   }
+  if (failed.size) showToast(`GAGAL mengirim ${failed.size} laporan — ${[...failed.values()][0]}`);
+  return failed;
 }
 function cloudSync() {
   cloudQueue = cloudQueue.catch(() => {}).then(cloudSyncNow);
@@ -1837,14 +1852,19 @@ async function cloudLoad() {
         cloudLoaded = true;
         if (!migrated) {
           // Pertama kali: data lama yang hanya ada di browser ini diunggah ke server.
-          if (reports.some(r => !remoteIds.has(String(r.id)))) {
-            const nUp = reports.filter(r => !remoteIds.has(String(r.id))).length;
+          let allOk = true;
+          const nUp = reports.filter(r => !remoteIds.has(String(r.id))).length;
+          if (nUp) {
             showToast(`Mengunggah ${nUp} laporan lama di perangkat ini ke server...`);
-            if (!(await cloudSync())) { cloudLoaded = false; return false; }
-            showToast(`✅ ${nUp} laporan lama berhasil diunggah ke server.`);
+            const failed = await cloudSync();
+            if (failed === null) { cloudLoaded = false; return false; }
             changed = true;
+            if (failed.size) {
+              allOk = false;
+              alert(`Sebagian laporan lama GAGAL diunggah: ${failed.size} dari ${nUp}.\n\nPenyebab (contoh): ${[...failed.values()][0]}\n\n${nUp - failed.size} laporan lainnya berhasil. Kirim screenshot pesan ini ke pembuat sistem.`);
+            } else showToast(`✅ ${nUp} laporan lama berhasil diunggah ke server.`);
           }
-          try { localStorage.setItem(CLOUD_MIGRATED_KEY, "1"); } catch (_) {}
+          if (allOk) { try { localStorage.setItem(CLOUD_MIGRATED_KEY, "1"); } catch (_) {} }
         } else {
           const before = reports.length;                   // server = sumber kebenaran
           reports = reports.filter(r => remoteIds.has(String(r.id)));
@@ -1862,12 +1882,13 @@ async function cloudLoad() {
   return cloudBusyLoad;
 }
 /* Pembungkus: simpan ke server (jika dikonfigurasi) + cache lokal. */
-async function persistReports() {
+async function persistReports(focusId) {
   if (!sb) return persistReportsLocal();
   if (!cloudLoaded && !(await cloudLoad())) { showToast("Belum terhubung ke server. Coba lagi sesaat lagi."); return false; }
-  if (!(await cloudSync())) return false;
+  const failed = await cloudSync();
+  if (failed === null) return false;
   persistReportsLocal(true);
-  return true;
+  return focusId ? !failed.has(String(focusId)) : failed.size === 0;
 }
 (function cloudStart() {
   if (!sb) return;
@@ -2960,7 +2981,7 @@ if ($("updateForm")) {
     if (updateMass) r.mass = updateMass;
     reports.forEach(x => x.isNew = false);
     r.isNew = true;
-    const saved = await persistReports();
+    const saved = await persistReports(r.id);
     if (!saved) {
       r.updates.pop();
       render();
@@ -3228,7 +3249,7 @@ $("reportForm").addEventListener("submit", e => {
     reports.unshift(newReport);
     if (submitBtn) { submitBtn.disabled = true; submitBtn.style.opacity = ".6"; }
     showToast("Mengirim laporan ke server...");
-    const savedOk = await persistReports();
+    const savedOk = await persistReports(newReport.id);
     if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = ""; }
     if (!savedOk) {
       reports = reports.filter(x => x.id !== newReport.id);
