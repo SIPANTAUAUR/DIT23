@@ -1833,12 +1833,15 @@ async function cloudLoad() {
       if (!cloudLoaded) {
         let migrated = false;
         try { migrated = localStorage.getItem(CLOUD_MIGRATED_KEY) === "1"; } catch (_) {}
+        if (/[?&]resync=1/.test(location.search)) migrated = false;   // paksa unggah ulang data lokal
         cloudLoaded = true;
         if (!migrated) {
           // Pertama kali: data lama yang hanya ada di browser ini diunggah ke server.
           if (reports.some(r => !remoteIds.has(String(r.id)))) {
-            showToast("Mengunggah data lama di perangkat ini ke server...");
+            const nUp = reports.filter(r => !remoteIds.has(String(r.id))).length;
+            showToast(`Mengunggah ${nUp} laporan lama di perangkat ini ke server...`);
             if (!(await cloudSync())) { cloudLoaded = false; return false; }
+            showToast(`✅ ${nUp} laporan lama berhasil diunggah ke server.`);
             changed = true;
           }
           try { localStorage.setItem(CLOUD_MIGRATED_KEY, "1"); } catch (_) {}
