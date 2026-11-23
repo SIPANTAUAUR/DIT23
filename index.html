@@ -1699,6 +1699,7 @@ const sb = (/^https:\/\/.+\.supabase\.co/i.test(SUPABASE_URL) && SUPABASE_ANON_K
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 if (!sb) console.warn("SIPANTAU: Supabase belum dikonfigurasi — data hanya tersimpan di browser ini.");
 
+let cloudLoadTried = false, cloudLastLoadError = "";
 let cloudLoaded = false, cloudBusyLoad = null, cloudQueue = Promise.resolve(), cloudRtSeen = false;
 const cloudSynced = new Map(); // id -> JSON stabil terakhir yang identik dengan server
 
@@ -1872,14 +1873,16 @@ function cloudStatusUpdate(failedMap) {
   el.style.bottom = window.innerWidth < 900 ? "70px" : "8px";
   const pending = reports.filter(r => !cloudSynced.has(String(r.id))).length;
   el.style.display = "";
-  if (!cloudLoaded) { el.style.background = "#fee2e2"; el.style.color = "#991b1b"; el.textContent = "☁️ Belum terhubung ke server — ketuk untuk coba lagi"; }
+  if (!cloudLoaded && !cloudLoadTried) { el.textContent = ""; el.style.display = "none"; }
+  else if (!cloudLoaded) { el.style.background = "#fee2e2"; el.style.color = "#991b1b"; el.textContent = "☁️ Belum terhubung ke server — ketuk untuk coba lagi"; }
   else if (!pending && cloudPendingMedia()) { el.style.background = "#fef3c7"; el.style.color = "#92400e"; el.textContent = `📤 ${cloudPendingMedia()} foto/video belum terunggah (dicoba otomatis) — ketuk untuk kirim`; }
   else if (pending) { el.style.background = "#fef3c7"; el.style.color = "#92400e"; el.textContent = `⚠️ ${pending} laporan belum terkirim ke server — ketuk untuk kirim`; }
   else { el.textContent = ""; el.style.display = "none"; }
 }
 async function cloudManualSync() {
   if (!cloudLoaded) { showToast("Menghubungkan ke server..."); await cloudLoad(); }
-  if (!cloudLoaded) { alert("Belum bisa terhubung ke server. Periksa internet lalu coba lagi."); return; }
+  cloudStatusUpdate();
+  if (!cloudLoaded) { alert("Belum bisa terhubung ke server.\n\nPenyebab: " + (cloudLastLoadError || "tidak diketahui") + "\n\nPeriksa internet, matikan ad-blocker/VPN, lalu coba lagi. Jika tetap gagal, screenshot pesan ini."); return; }
   const before = reports.filter(r => !cloudSynced.has(String(r.id))).length;
   if (before) showToast(`Mengirim ${before} laporan ke server...`);
   const failed = await cloudSync();
@@ -1957,10 +1960,11 @@ async function cloudLoad() {
       return true;
     } catch (err) {
       console.error("Gagal memuat data dari server:", err);
+      cloudLastLoadError = (err && err.message) ? err.message : String(err);
       if (!cloudLoaded) showToast("Tidak dapat terhubung ke server data. Periksa internet / konfigurasi Supabase.");
       cloudStatusUpdate();
       return false;
-    } finally { cloudBusyLoad = null; }
+    } finally { cloudLoadTried = true; cloudBusyLoad = null; }
   })();
   return cloudBusyLoad;
 }
