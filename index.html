@@ -2106,7 +2106,7 @@ function feedInfoHtml(x, ongoing) {
   const clip = t => String(t || "").trim();
   const seen = new Set(), items = [];
   const add = t => { t = cleanReportText(clip(t)); const k = t.toLowerCase(); if (t && t !== "-" && !seen.has(k)) { seen.add(k); items.push(t); } };
-  String(x.demands || "").split(/\r?\n|\s*;\s*/).forEach(add);
+  String(x.demands || "").split(/\r?\n|\s*;\s*|(?<=[.!?])\s+(?=[A-Z0-9])/).forEach(add);
   (x.updates || []).forEach(u => (u.demands || []).forEach(add));
   const shown = items.slice(0, 4), more = items.length - shown.length;
   const demandsHtml = shown.length
