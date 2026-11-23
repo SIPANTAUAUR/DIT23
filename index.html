@@ -1709,7 +1709,11 @@ function stableStringify(v) {
 }
 /* Data yang dikirim ke server: tanpa blob/base64 (file diunggah ke Storage) dan tanpa flag tampilan lokal. */
 function cloudPayload(r) {
-  return JSON.parse(JSON.stringify(r, (k, v) => (k === "blob" || k === "imgBase64" || k === "dataUrl" || k === "isNew") ? undefined : v));
+  return JSON.parse(JSON.stringify(r, (k, v) => {
+    if (k === "blob" || k === "imgBase64" || k === "dataUrl" || k === "isNew" || k === "cloudPath") return undefined;
+    if (typeof v === "string" && ((/^data:/i.test(v) && v.length > 2000) || /^blob:/i.test(v))) return undefined;
+    return v;
+  }));
 }
 function extFromType(t) {
   t = String(t || "").toLowerCase();
@@ -1730,27 +1734,71 @@ async function cloudUploadBlob(path, blob) {
 }
 const cloudSafeId = id => String(id).replace(/[^A-Za-z0-9_-]/g, "_");
 /* Unggah foto/video yang masih berupa Blob/base64 ke Storage lalu ganti dengan URL publik. */
+let cloudLastMediaError = "";
+/* Unggah foto/video; kegagalan satu file TIDAK menghentikan pengiriman teks laporan (file dicoba ulang otomatis). */
 async function cloudUploadReportMedia(r) {
   const dir = cloudSafeId(r.id);
-  if (r.imgBase64 && /^data:/i.test(r.imgBase64)) {
-    const blob = await (await fetch(r.imgBase64)).blob();
-    r.imgUrl = await cloudUploadBlob(`${dir}/initial.${extFromType(blob.type)}`, blob);
-    r.imgBase64 = "";
-  } else if (/^blob:/i.test(r.imgUrl || "")) {
-    r.imgUrl = "";
-  }
+  try {
+    if (r.imgBase64 && /^data:/i.test(r.imgBase64)) {
+      const blob = await (await fetch(r.imgBase64)).blob();
+      r.imgUrl = await cloudUploadBlob(`${dir}/initial.${extFromType(blob.type)}`, blob);
+      r.imgBase64 = "";
+    } else if (/^blob:/i.test(r.imgUrl || "")) {
+      r.imgUrl = "";
+    }
+  } catch (err) { cloudLastMediaError = `${r.code || r.id}: ${err && err.message ? err.message : err}`; console.warn("Foto awal belum terunggah", r.id, err); }
   for (const u of (r.updates || [])) {
     const m = u && u.media;
     if (!m) continue;
-    let blob = null;
-    if (m.blob instanceof Blob) blob = m.blob;
-    else if (m.dataUrl && /^data:/i.test(m.dataUrl)) blob = await (await fetch(m.dataUrl)).blob();
-    if (!blob) continue;
-    const type = m.type || blob.type;
-    const file = blob.type === type ? blob : new Blob([blob], { type });
-    if (!m.cloudPath) m.cloudPath = `${dir}/upd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${extFromType(type)}`;
-    m.url = await cloudUploadBlob(m.cloudPath, file);
-    m.cloud = true; m.size = file.size; delete m.blob; delete m.dataUrl;
+    try {
+      let blob = null;
+      if (m.blob instanceof Blob) blob = m.blob;
+      else if (m.dataUrl && /^data:/i.test(m.dataUrl)) blob = await (await fetch(m.dataUrl)).blob();
+      if (!blob) continue;
+      const type = m.type || blob.type;
+      const file = blob.type === type ? blob : new Blob([blob], { type });
+      if (!m.cloudPath) m.cloudPath = `${dir}/upd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${extFromType(type)}`;
+      m.url = await cloudUploadBlob(m.cloudPath, file);
+      m.cloud = true; m.size = file.size; delete m.blob; delete m.dataUrl;
+    } catch (err) { cloudLastMediaError = `${r.code || r.id}: ${err && err.message ? err.message : err}`; console.warn("Media belum terunggah", r.id, err); }
+  }
+  await cloudOffloadDataUrls(r);
+}
+/* Data foto/video yang tertanam langsung di dalam laporan (format lama) dipindahkan ke Storage. */
+async function cloudOffloadDataUrls(r) {
+  const dir = cloudSafeId(r.id), jobs = [];
+  (function walk(o, path) {
+    if (!o || typeof o !== "object" || o instanceof Blob) return;
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      if (typeof v === "string" && v.length > 2000 && /^data:/i.test(v) && k !== "imgBase64") jobs.push({ o, k, path: path.concat(k) });
+      else if (v && typeof v === "object") walk(v, path.concat(k));
+    }
+  })(r, []);
+  for (const j of jobs) {
+    try {
+      const blob = await (await fetch(j.o[j.k])).blob();
+      j.o[j.k] = await cloudUploadBlob(`${dir}/emb-${j.path.join("-").replace(/[^A-Za-z0-9_-]/g, "_")}.${extFromType(blob.type)}`, blob);
+      j.o.cloud = true;
+    } catch (err) { cloudLastMediaError = `${r.code || r.id}: ${err && err.message ? err.message : err}`; console.warn("Data tertanam belum terunggah", r.id, err); }
+  }
+}
+function cloudPendingMedia() {
+  let n = 0;
+  for (const r of reports) {
+    if (r.imgBase64 && /^data:/i.test(r.imgBase64)) n++;
+    for (const u of (r.updates || [])) { const m = u && u.media; if (m && (m.blob instanceof Blob || (m.dataUrl && /^data:/i.test(m.dataUrl)))) n++; }
+  }
+  return n;
+}
+/* Jaga agar file yang belum terunggah (masih di perangkat ini) tidak hilang saat data dari server masuk. */
+function cloudMergeLocalMedia(oldR, newR) {
+  if (!oldR) return;
+  if (oldR.imgBase64 && !newR.imgUrl) newR.imgBase64 = oldR.imgBase64;
+  for (const nu of (newR.updates || [])) {
+    if (!nu.media || nu.media.url) continue;
+    const ou = (oldR.updates || []).find(x => x && x.media && x.time === nu.time && x.text === nu.text && (x.media.blob instanceof Blob || x.media.dataUrl));
+    if (ou) { nu.media.blob = ou.media.blob; nu.media.dataUrl = ou.media.dataUrl; nu.media.cloudPath = ou.media.cloudPath; }
   }
 }
 async function cloudRemoveReportFiles(id) {
@@ -1782,13 +1830,14 @@ async function cloudSyncNow() {
   let doneN = 0;
   for (const r of reports.slice()) {
     const id = String(r.id);
-    let prev;
+    let prev, sizeKB = 0;
     try {
       if (todo.includes(r) && todo.length > 1) { doneN++; showToast(`Mengunggah laporan ${doneN} dari ${todo.length}: ${r.code || id} ...`); }
       await cloudUploadReportMedia(r);
       const payload = cloudPayload(r);
       const json = stableStringify(payload);
       if (cloudSynced.get(id) === json) continue;
+      sizeKB = Math.round(json.length / 1024);
       prev = cloudSynced.get(id);
       cloudSynced.set(id, json); // set lebih dulu agar "gema" realtime milik sendiri diabaikan
       const { error } = await sb.from("reports").upsert({
@@ -1798,7 +1847,7 @@ async function cloudSyncNow() {
     } catch (err) {
       if (prev !== undefined || cloudSynced.has(id)) { if (prev === undefined) cloudSynced.delete(id); else cloudSynced.set(id, prev); }
       const msg = (err && err.message) ? err.message : String(err);
-      failed.set(id, `${r.code || id}: ${msg}`);
+      failed.set(id, `${r.code || id}: ${msg} (ukuran data ${sizeKB} KB)`);
       console.error("Gagal sinkron laporan", id, err);
     }
   }
@@ -1822,9 +1871,11 @@ function cloudStatusUpdate(failedMap) {
   }
   el.style.bottom = window.innerWidth < 900 ? "70px" : "8px";
   const pending = reports.filter(r => !cloudSynced.has(String(r.id))).length;
+  el.style.display = "";
   if (!cloudLoaded) { el.style.background = "#fee2e2"; el.style.color = "#991b1b"; el.textContent = "☁️ Belum terhubung ke server — ketuk untuk coba lagi"; }
+  else if (!pending && cloudPendingMedia()) { el.style.background = "#fef3c7"; el.style.color = "#92400e"; el.textContent = `📤 ${cloudPendingMedia()} foto/video belum terunggah (dicoba otomatis) — ketuk untuk kirim`; }
   else if (pending) { el.style.background = "#fef3c7"; el.style.color = "#92400e"; el.textContent = `⚠️ ${pending} laporan belum terkirim ke server — ketuk untuk kirim`; }
-  else { el.style.background = "#dcfce7"; el.style.color = "#166534"; el.textContent = `☁️ Tersinkron · ${cloudSynced.size} laporan di server`; }
+  else { el.textContent = ""; el.style.display = "none"; }
 }
 async function cloudManualSync() {
   if (!cloudLoaded) { showToast("Menghubungkan ke server..."); await cloudLoad(); }
@@ -1835,6 +1886,7 @@ async function cloudManualSync() {
   if (failed === null) { alert("Gagal terhubung ke server. Periksa internet lalu coba lagi."); return; }
   persistReportsLocal(true);
   if (failed.size) alert(`${failed.size} laporan GAGAL dikirim:\n\n` + [...failed.values()].slice(0, 8).join("\n\n") + "\n\nScreenshot pesan ini dan kirim ke pembuat sistem.");
+  else if (cloudPendingMedia()) alert(`Teks laporan sudah terkirim, tetapi ${cloudPendingMedia()} foto/video BELUM terunggah.\n\nPenyebab: ${cloudLastMediaError || "koneksi tidak stabil"}\n\nSistem akan mencoba lagi otomatis tiap 1 menit. Biarkan halaman ini terbuka.`);
   else if (before) alert(`✅ Semua laporan berhasil dikirim ke server (${before} laporan).`);
   else showToast("Semua laporan sudah tersinkron.");
 }
@@ -1854,7 +1906,7 @@ function cloudApplyRow(row, live) {
   const idx = reports.findIndex(x => String(x.id) === id);
   if (live) reports.forEach(x => x.isNew = false);
   incoming.isNew = !!live;
-  if (idx >= 0) reports[idx] = incoming;
+  if (idx >= 0) { cloudMergeLocalMedia(reports[idx], incoming); reports[idx] = incoming; }
   else {
     reports.unshift(incoming);
     if (live) showToast(`🔔 Laporan baru masuk: ${incoming.code || incoming.aurLoc || id}`);
@@ -1942,7 +1994,7 @@ async function persistReports(focusId) {
       });
     document.addEventListener("visibilitychange", () => { if (!document.hidden) cloudLoad(); });
     window.addEventListener("online", () => cloudLoad());
-    setInterval(() => { if (!document.hidden) cloudLoad(); }, 60000); // jaring pengaman bila koneksi realtime terputus
+    setInterval(async () => { if (document.hidden && !cloudPendingMedia()) return; await cloudLoad(); if (cloudLoaded && cloudPendingMedia()) { await cloudSync(); persistReportsLocal(true); } }, 60000); // jaring pengaman bila koneksi realtime terputus
   }, 0);
 })();
 
