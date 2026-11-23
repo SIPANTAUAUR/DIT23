@@ -1721,9 +1721,11 @@ function extFromType(t) {
 async function cloudUploadBlob(path, blob) {
   const type = blob.type || "application/octet-stream";
   const sizeMB = (blob.size / 1048576).toFixed(1);
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error(`waktu habis saat mengunggah file ${sizeMB} MB (koneksi lambat/file terlalu besar)`)), 120000));
+  if (blob.size > 3 * 1048576) showToast(`Mengunggah file ${sizeMB} MB — harap tunggu, jangan tutup halaman ini...`);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error(`waktu habis (15 menit) saat mengunggah file ${sizeMB} MB — koneksi terlalu lambat`)), 900000));
   const { error } = await Promise.race([sb.storage.from(SUPABASE_BUCKET).upload(path, blob, { contentType: type, cacheControl: "31536000", upsert: false }), timeout]);
-  if (error) throw error;
+  // Jika file dengan nama sama sudah ada (percobaan sebelumnya sempat selesai), anggap berhasil.
+  if (error && !/already exists|duplicate|resource already/i.test(String(error.message || "") + " " + String(error.statusCode || ""))) throw error;
   return sb.storage.from(SUPABASE_BUCKET).getPublicUrl(path).data.publicUrl;
 }
 const cloudSafeId = id => String(id).replace(/[^A-Za-z0-9_-]/g, "_");
@@ -1732,7 +1734,7 @@ async function cloudUploadReportMedia(r) {
   const dir = cloudSafeId(r.id);
   if (r.imgBase64 && /^data:/i.test(r.imgBase64)) {
     const blob = await (await fetch(r.imgBase64)).blob();
-    r.imgUrl = await cloudUploadBlob(`${dir}/initial-${Date.now()}.${extFromType(blob.type)}`, blob);
+    r.imgUrl = await cloudUploadBlob(`${dir}/initial.${extFromType(blob.type)}`, blob);
     r.imgBase64 = "";
   } else if (/^blob:/i.test(r.imgUrl || "")) {
     r.imgUrl = "";
@@ -1746,7 +1748,8 @@ async function cloudUploadReportMedia(r) {
     if (!blob) continue;
     const type = m.type || blob.type;
     const file = blob.type === type ? blob : new Blob([blob], { type });
-    m.url = await cloudUploadBlob(`${dir}/upd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${extFromType(type)}`, file);
+    if (!m.cloudPath) m.cloudPath = `${dir}/upd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${extFromType(type)}`;
+    m.url = await cloudUploadBlob(m.cloudPath, file);
     m.cloud = true; m.size = file.size; delete m.blob; delete m.dataUrl;
   }
 }
@@ -1803,12 +1806,42 @@ async function cloudSyncNow() {
   return failed;
 }
 function cloudSync() {
-  cloudQueue = cloudQueue.catch(() => {}).then(cloudSyncNow);
+  cloudQueue = cloudQueue.catch(() => {}).then(cloudSyncNow).then(r => { cloudStatusUpdate(r); return r; });
   return cloudQueue;
+}
+let cloudLastFailed = new Map();
+function cloudStatusUpdate(failedMap) {
+  if (failedMap instanceof Map) cloudLastFailed = failedMap;
+  let el = document.getElementById("cloudStatus");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "cloudStatus";
+    el.style.cssText = "position:fixed;left:8px;z-index:99999;font:600 11px/1.3 system-ui,sans-serif;padding:6px 10px;border-radius:999px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);user-select:none;max-width:70vw;";
+    el.addEventListener("click", cloudManualSync);
+    document.body.appendChild(el);
+  }
+  el.style.bottom = window.innerWidth < 900 ? "70px" : "8px";
+  const pending = reports.filter(r => !cloudSynced.has(String(r.id))).length;
+  if (!cloudLoaded) { el.style.background = "#fee2e2"; el.style.color = "#991b1b"; el.textContent = "☁️ Belum terhubung ke server — ketuk untuk coba lagi"; }
+  else if (pending) { el.style.background = "#fef3c7"; el.style.color = "#92400e"; el.textContent = `⚠️ ${pending} laporan belum terkirim ke server — ketuk untuk kirim`; }
+  else { el.style.background = "#dcfce7"; el.style.color = "#166534"; el.textContent = `☁️ Tersinkron · ${cloudSynced.size} laporan di server`; }
+}
+async function cloudManualSync() {
+  if (!cloudLoaded) { showToast("Menghubungkan ke server..."); await cloudLoad(); }
+  if (!cloudLoaded) { alert("Belum bisa terhubung ke server. Periksa internet lalu coba lagi."); return; }
+  const before = reports.filter(r => !cloudSynced.has(String(r.id))).length;
+  if (before) showToast(`Mengirim ${before} laporan ke server...`);
+  const failed = await cloudSync();
+  if (failed === null) { alert("Gagal terhubung ke server. Periksa internet lalu coba lagi."); return; }
+  persistReportsLocal(true);
+  if (failed.size) alert(`${failed.size} laporan GAGAL dikirim:\n\n` + [...failed.values()].slice(0, 8).join("\n\n") + "\n\nScreenshot pesan ini dan kirim ke pembuat sistem.");
+  else if (before) alert(`✅ Semua laporan berhasil dikirim ke server (${before} laporan).`);
+  else showToast("Semua laporan sudah tersinkron.");
 }
 function cloudRefreshUI() {
   try { persistReportsLocal(true); } catch (_) {}
   render();
+  cloudStatusUpdate();
 }
 /* Terapkan baris dari server. live=true => dari event realtime (tampilkan notifikasi). */
 function cloudApplyRow(row, live) {
@@ -1865,17 +1898,15 @@ async function cloudLoad() {
             } else showToast(`✅ ${nUp} laporan lama berhasil diunggah ke server.`);
           }
           if (allOk) { try { localStorage.setItem(CLOUD_MIGRATED_KEY, "1"); } catch (_) {} }
-        } else {
-          const before = reports.length;                   // server = sumber kebenaran
-          reports = reports.filter(r => remoteIds.has(String(r.id)));
-          if (reports.length !== before) changed = true;
         }
       }
       if (changed) cloudRefreshUI();
+      cloudStatusUpdate();
       return true;
     } catch (err) {
       console.error("Gagal memuat data dari server:", err);
       if (!cloudLoaded) showToast("Tidak dapat terhubung ke server data. Periksa internet / konfigurasi Supabase.");
+      cloudStatusUpdate();
       return false;
     } finally { cloudBusyLoad = null; }
   })();
@@ -1893,6 +1924,7 @@ async function persistReports(focusId) {
 (function cloudStart() {
   if (!sb) return;
   setTimeout(() => {
+    cloudStatusUpdate();
     cloudLoad();
     sb.channel("sipantau-reports-live")
       .on("postgres_changes", { event: "*", schema: "public", table: "reports" }, payload => {
